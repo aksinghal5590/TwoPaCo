@@ -7,9 +7,9 @@ if(CMAKE_COMPILER_IS_GNUCXX)
 endif()
 
 add_executable(twopaco ../common/dnachar.cpp constructor.cpp concurrentbitvector.cpp compressedstring.cpp ../common/streamfastaparser.cpp test.cpp vertexenumerator.cpp ../common/spooky/SpookyV2.cpp common.cpp)
-link_directories(${TBB_LIB_DIR})
-include_directories(${twopaco_SOURCE_DIR} ${TBB_INCLUDE_DIR} "../common") 
-target_link_libraries(twopaco  "tbb")
+link_directories(${TBB_LIB_DIR} "/usr/local/lib")
+include_directories(${twopaco_SOURCE_DIR} ${TBB_INCLUDE_DIR} "../common" "/usr/local/include/cuckoofilter") 
+target_link_libraries(twopaco  "tbb" "cuckoofilter.a")
 
 set(CPACK_PACKAGE_VERSION_MAJOR "0")
 set(CPACK_PACKAGE_VERSION_MINOR "9")

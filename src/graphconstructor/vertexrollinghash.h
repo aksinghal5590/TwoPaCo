@@ -1,9 +1,13 @@
 #ifndef _VERTEX_ROLLING_HASH_H_
 #define _VERTEX_ROLLING_HASH_H_
 
+#include <cuckoofilter/cuckoofilter.h>
+
 #include "common.h"
 #include "concurrentbitvector.h"
 #include "ngramhashing/cyclichash.h"
+
+using namespace cuckoofilter;
 
 namespace TwoPaCo
 {
@@ -205,12 +209,40 @@ namespace TwoPaCo
 		std::vector<HashFunctionPtr> negVertexHash_;			
 	};
 
+	inline bool IsOutgoingEdgeInBloomFilter(const VertexRollingHash & hash, const CuckooFilter<size_t, 32> & cFilter, char nextCh)
+	{
+		VertexRollingHash::StrandComparisonResult result = hash.DetermineStrandExtend(nextCh);	
+		for (size_t i = 0; i < hash.HashFunctionsNumber(); i++)
+		{
+			if (cFilter.Contain(hash.GetOutgoingEdgeHash(nextCh, result, i)) != cuckoofilter::Ok)
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	inline bool IsOutgoingEdgeInBloomFilter(const VertexRollingHash & hash, const ConcurrentBitVector & filter, char nextCh)
 	{
 		VertexRollingHash::StrandComparisonResult result = hash.DetermineStrandExtend(nextCh);	
 		for (size_t i = 0; i < hash.HashFunctionsNumber(); i++)
 		{
 			if (!filter.GetBit(hash.GetOutgoingEdgeHash(nextCh, result, i)))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	inline bool IsIngoingEdgeInBloomFilter(const VertexRollingHash & hash, const CuckooFilter<size_t, 32> & cFilter, char prevCh)
+	{
+		VertexRollingHash::StrandComparisonResult result = hash.DetermineStrandPrepend(prevCh);
+		for (size_t i = 0; i < hash.HashFunctionsNumber(); i++)
+		{
+			if (cFilter.Contain(hash.GetIngoingEdgeHash(prevCh, result, i)) != cuckoofilter::Ok)
 			{
 				return false;
 			}
