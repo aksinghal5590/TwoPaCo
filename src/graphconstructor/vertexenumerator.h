@@ -4,10 +4,13 @@
 #define MAX_CAPACITY 20
 
 #include <deque>
+#include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <numeric>
 #include <sstream>
 #include <unordered_map>
+#include <algorithm>
 
 #include <tbb/tbb.h>
 #include <tbb/mutex.h>
@@ -63,7 +66,7 @@ namespace TwoPaCo
 		std::string filterDumpFile_;
 		VertexRollingHashSeed hashFunctionSeed_;
 		static const size_t BUF_SIZE = 1 << 24;
-		BifurcationStorage<CAPACITY> bifStorage_;		
+		BifurcationStorage<CAPACITY> bifStorage_;
 		typedef CompressedString<CAPACITY> DnaString;
 		typedef CandidateOccurence<CAPACITY> Occurence;
 
@@ -164,7 +167,7 @@ namespace TwoPaCo
 
 			tbb::mutex errorMutex;
 			std::unique_ptr<std::runtime_error> error;
-			
+
 			size_t edgeLength = vertexLength + 1;
 			std::vector<TaskQueuePtr> taskQueue(threads);
 			for (size_t i = 0; i < taskQueue.size(); i++)
@@ -182,12 +185,11 @@ namespace TwoPaCo
 				std::vector<std::unique_ptr<tbb::tbb_thread> > workerThread(threads);
 				binCounter = new std::atomic<uint32_t>[BINS_COUNT];
 				std::fill(binCounter, binCounter + BINS_COUNT, 0);
-				ConcurrentBitVector bitVector(realSize);
+				CuckooFilter<uint64_t, 32> cuckooFilter(realSize + 1);
 				for (size_t i = 0; i < workerThread.size(); i++)
 				{
 					InitialFilterFillerWorker worker(BIN_SIZE,
-						hashFunctionSeed_,
-						bitVector,
+						cuckooFilter,
 						vertexLength,
 						*taskQueue[i],
 						binCounter);
@@ -220,7 +222,8 @@ namespace TwoPaCo
 				throw StreamFastaParser::Exception("Can't create a temp file");
 			}
 
-			time_t mark;			
+			time_t mark;
+			size_t ioTime = 0;
 			for (size_t round = 0; round < rounds; round++)
 			{
 				std::atomic<uint64_t> marks;
@@ -250,18 +253,14 @@ namespace TwoPaCo
 				}
 
 				{
-					CuckooFilter<size_t, 32> cFilter(realSize/32 + 1);
-					//ConcurrentBitVector bitVector(realSize);
+					CuckooFilter<uint64_t, 32> cFilter(realSize);
 					logStream << "Round " << round << ", " << low << ":" << high << std::endl;
 					logStream << "Pass\tFilling\tFiltering" << std::endl << "1\t";
 					{
 						std::vector<std::unique_ptr<tbb::tbb_thread> > workerThread(threads);
 						for (size_t i = 0; i < workerThread.size(); i++)
 						{
-							FilterFillerWorker worker(low,
-								high,
-								std::cref(hashFunctionSeed_),
-								edgeLength,
+							FilterFillerWorker worker(edgeLength,
 								std::ref(cFilter),
 								std::ref(*taskQueue[i]));
 							workerThread[i].reset(new tbb::tbb_thread(worker));
@@ -274,23 +273,21 @@ namespace TwoPaCo
 						}
 					}
 
-					//bitVector.WriteToFile(filterDumpFile_);
 					logStream << time(0) - mark << "\t";
 					mark = time(0);
 					{
 						std::vector<std::unique_ptr<tbb::tbb_thread> > workerThread(threads);
 						for (size_t i = 0; i < workerThread.size(); i++)
 						{
-							CandidateCheckingWorker worker(std::make_pair(low, high),
-								hashFunctionSeed_,
-								vertexLength,
+							CandidateCheckingWorker worker(vertexLength,
 								cFilter,
 								*taskQueue[i],
 								tmpDirName,
 								marks,
 								round,
 								error,
-								errorMutex);
+								errorMutex,
+								ioTime);
 
 							workerThread[i].reset(new tbb::tbb_thread(worker));
 						}
@@ -326,7 +323,8 @@ namespace TwoPaCo
 							tmpDirName,
 							round,
 							error,
-							errorMutex);
+							errorMutex,
+							ioTime);
 
 						workerThread[i].reset(new tbb::tbb_thread(worker));
 					}
@@ -353,6 +351,7 @@ namespace TwoPaCo
 				logStream << "False junctions count = " << falsePositives << std::endl;
 				logStream << "Hash table size = " << occurenceSet.size() << std::endl;
 				logStream << "Candidate marks count = " << marks << std::endl;
+				logStream << "ioTime = " << ioTime << std::endl;
 				logStream << std::string(80, '-') << std::endl;
 				totalFpCount += falsePositives;
 				verticesCount += truePositives;
@@ -364,7 +363,7 @@ namespace TwoPaCo
 				delete[] binCounter;
 			}
 
-			mark = time(0);			
+			mark = time(0);
 			std::string bifurcationTempReadName = (tmpDirName + "/bifurcations.bin");
 			bifurcationTempWrite.close();
 			{
@@ -380,10 +379,10 @@ namespace TwoPaCo
 			std::remove(bifurcationTempReadName.c_str());
 			logStream << "Reallocating bifurcations time: " << time(0) - mark << std::endl;
 
-			mark = time(0);			
+			mark = time(0);
 			std::atomic<uint64_t> occurence;
 			tbb::mutex currentStubVertexMutex;
-			std::atomic<uint64_t> currentPiece;			
+			std::atomic<uint64_t> currentPiece;
 			uint64_t currentStubVertexId = verticesCount + 42;
 			JunctionPositionWriter posWriter(outFileNamePrefix);
 			occurence = currentPiece = 0;
@@ -427,7 +426,7 @@ namespace TwoPaCo
 	private:
 
 		static const size_t QUEUE_CAPACITY = 16;
-		static const uint64_t BINS_COUNT = 1 << 24;		
+		static const uint64_t BINS_COUNT = 1 << 24;
 
 		static bool Within(uint64_t hvalue, uint64_t low, uint64_t high)
 		{
@@ -456,11 +455,10 @@ namespace TwoPaCo
 		{
 		public:
 			InitialFilterFillerWorker(uint64_t binSize,
-				const VertexRollingHashSeed & hashFunction,
-				ConcurrentBitVector & filter,
+				CuckooFilter<uint64_t, 32> & cFilter,
 				size_t vertexLength,
 				TaskQueue & taskQueue,
-				std::atomic<uint32_t> * binCounter) : binSize(binSize), hashFunction(hashFunction), filter(filter),
+				std::atomic<uint32_t> * binCounter) : binSize(binSize), cFilter(cFilter),
 				vertexLength(vertexLength), taskQueue(taskQueue), binCounter(binCounter)
 			{
 
@@ -484,31 +482,13 @@ namespace TwoPaCo
 							continue;
 						}
 
-						std::vector<uint64_t> hashValue;
-						size_t vertexLength = edgeLength - 1;						
-						VertexRollingHash hash(hashFunction, task.str.begin(), hashFunction.HashFunctionsNumber());
 						for (size_t pos = 0; pos + edgeLength - 1 < task.str.size(); ++pos)
-						{							
-							hashValue.clear();
+						{
 							bool wasSet = true;
-							char prevCh = task.str[pos];
-							char nextCh = task.str[pos + edgeLength - 1];
-							uint64_t startVertexHash = hash.GetVertexHash();							
-							GetOutgoingEdgeHash(hash, nextCh, hashValue);
-							for (auto hvalue : hashValue)
-							{
-								if (!filter.GetBit(hvalue))
-								{
-									wasSet = false;
-									filter.SetBitConcurrently(hvalue);
-								}
-							}
-
-							hash.Update(prevCh, nextCh);
-							assert(hash.Assert(task.str.begin() + pos + 1));
-
-							uint64_t endVertexHash = hash.GetVertexHash();
-							if (!wasSet)
+							string edge = task.str.substr(pos, edgeLength);
+							cFilter.Add(getCanonicalVal(edge));
+							//TODO
+							/*if (!wasSet)
 							{
 								uint64_t value[] = { startVertexHash, endVertexHash };
 								for (uint64_t v : value)
@@ -519,7 +499,7 @@ namespace TwoPaCo
 										binCounter[bin].fetch_add(1);
 									}
 								}
-							}
+							}*/
 						}
 					}
 				}
@@ -527,39 +507,49 @@ namespace TwoPaCo
 
 		private:
 			uint64_t binSize;
-			const VertexRollingHashSeed & hashFunction;
-			ConcurrentBitVector & filter;
+			CuckooFilter<uint64_t, 32> & cFilter;
 			size_t vertexLength;
 			TaskQueue & taskQueue;
 			std::atomic<uint32_t> * binCounter;
+
+			uint64_t getCanonicalVal(const string& edge) {
+				string revEdge = DnaChar::ReverseCompliment(edge);
+				int comRet = edge.compare(revEdge);
+				if(comRet > 0) {
+					return convertToInt(revEdge);
+				} else {
+					return convertToInt(edge);
+				}
+			}
+			uint64_t convertToInt(const string& edge) {
+				uint64_t ret = 0;
+				for(int i = 0; i < edge.size(); i++) {
+					ret += ((DnaChar::MakeUpChar(edge[i]) & 0x03) << (2*i));
+				}
+				return ret;
+			}
 		};
 
 
 		class CandidateCheckingWorker
 		{
 		public:
-			CandidateCheckingWorker(std::pair<uint64_t, uint64_t> bound,
-				const VertexRollingHashSeed & hashFunction,
-				size_t vertexLength,
-				CuckooFilter<size_t, 32> & cFilter,
+			CandidateCheckingWorker(size_t vertexLength,
+				CuckooFilter<uint64_t, 32> & cFilter,
 				TaskQueue & taskQueue,
 				const std::string & tmpDirectory,
 				std::atomic<uint64_t> & marksCount,
 				size_t round,
-				std::unique_ptr<std::runtime_error> & error,				
-				tbb::mutex & errorMutex) : bound(bound), hashFunction(hashFunction), vertexLength(vertexLength), cFilter(cFilter), taskQueue(taskQueue),
-				tmpDirectory(tmpDirectory), marksCount(marksCount), error(error), errorMutex(errorMutex), round(round)
+				std::unique_ptr<std::runtime_error> & error,
+				tbb::mutex & errorMutex,
+				size_t & ioTime) : vertexLength(vertexLength), cFilter(cFilter), taskQueue(taskQueue),
+				tmpDirectory(tmpDirectory), marksCount(marksCount), error(error), errorMutex(errorMutex), round(round), ioTime(ioTime)
 			{
 
 			}
 
 			void operator()()
 			{
-				uint64_t low = bound.first;
-				uint64_t high = bound.second;
-				std::vector<uint64_t> temp;
-				//ConcurrentBitVector candidateMask(Task::TASK_SIZE);
-				CuckooFilter<size_t, 32> candidateFilter(Task::TASK_SIZE);
 				while (true)
 				{
 					Task task;
@@ -575,16 +565,16 @@ namespace TwoPaCo
 							continue;
 						}
 
+						CuckooFilter<uint64_t, 32> candidateFilter(Task::TASK_SIZE);
 						size_t edgeLength = vertexLength + 1;
 						if (task.str.size() >= vertexLength + 2)
 						{
-							//candidateMask.Reset();
-							VertexRollingHash hash(hashFunction, task.str.begin() + 1, hashFunction.HashFunctionsNumber());
 							size_t definiteCount = std::count_if(task.str.begin() + 1, task.str.begin() + vertexLength + 1, DnaChar::IsDefinite);
 							for (size_t pos = 1;; ++pos)
 							{
 								char posPrev = task.str[pos - 1];
 								char posExtend = task.str[pos + vertexLength];
+								string vertex = task.str.substr(pos, vertexLength);
 								assert(definiteCount == std::count_if(task.str.begin() + pos, task.str.begin() + pos + vertexLength, DnaChar::IsDefinite));
 								if (definiteCount == vertexLength)
 								{
@@ -593,12 +583,16 @@ namespace TwoPaCo
 									for (int i = 0; i < DnaChar::LITERAL.size() && inCount < 2 && outCount < 2; i++)
 									{
 										char nextCh = DnaChar::LITERAL[i];
-										if (nextCh == posPrev || (cFilter.Contain(pos) == cuckoofilter::Ok))
+										string prevEdge = nextCh + vertex;
+										string nextEdge = vertex + nextCh;
+										uint64_t prevEdgeVal = getCanonicalVal(prevEdge);
+										uint64_t nextEdgeVal = getCanonicalVal(nextEdge);
+										if ((nextCh == posPrev) || (cFilter.Contain(prevEdgeVal) == Status::Ok))
 										{
 											++inCount;
 										}
 
-										if (nextCh == posExtend || (cFilter.Contain(pos) == cuckoofilter::Ok))
+										if ((nextCh == posExtend) || (cFilter.Contain(nextEdgeVal) == Status::Ok))
 										{
 											++outCount;
 										}
@@ -607,8 +601,10 @@ namespace TwoPaCo
 									if (inCount > 1 || outCount > 1)
 									{
 										++marksCount;
-										if(candidateFilter.Contain(pos) != cuckoofilter::Ok)
+										if(candidateFilter.Contain(pos) != Status::Ok)
+										{
 											candidateFilter.Add(pos);
+										}
 									}
 								}
 
@@ -616,8 +612,6 @@ namespace TwoPaCo
 								{
 									char posPrev = task.str[pos];
 									definiteCount += (DnaChar::IsDefinite(task.str[pos + vertexLength]) ? 1 : 0) - (DnaChar::IsDefinite(task.str[pos]) ? 1 : 0);
-									hash.Update(posPrev, posExtend);
-									assert(hash.Assert(task.str.begin() + pos + 1));
 								}
 								else
 								{
@@ -627,7 +621,14 @@ namespace TwoPaCo
 
 							try
 							{
-								candidateFilter.writeToFile(CandidateMaskFileName(tmpDirectory, task.seqId, task.start, round));
+								if(candidateFilter.Size() > 0)
+								{
+									auto start = std::chrono::system_clock::now();
+									candidateFilter.writeToFile(CandidateMaskFileName(tmpDirectory, task.seqId, task.start, round));
+									auto end = std::chrono::system_clock::now();
+									std::chrono::duration<double, std::milli> elapsed_mseconds = end - start;
+									ioTime += elapsed_mseconds.count();
+								}
 							}
 							catch (std::runtime_error & err)
 							{
@@ -639,16 +640,32 @@ namespace TwoPaCo
 			}
 
 		private:
-			std::pair<uint64_t, uint64_t> bound;
-			const VertexRollingHashSeed & hashFunction;
 			size_t vertexLength;
-			CuckooFilter<size_t, 32> & cFilter;
+			CuckooFilter<uint64_t, 32> & cFilter;
 			TaskQueue & taskQueue;
 			const std::string & tmpDirectory;
 			std::atomic<uint64_t> & marksCount;
 			size_t round;
 			std::unique_ptr<std::runtime_error> & error;
 			tbb::mutex & errorMutex;
+			size_t & ioTime;
+
+			uint64_t getCanonicalVal(const string& edge) {
+				string revEdge = DnaChar::ReverseCompliment(edge);
+				int comRet = edge.compare(revEdge);
+				if(comRet > 0) {
+					return convertToInt(revEdge);
+				} else {
+					return convertToInt(edge);
+				}
+			}
+			uint64_t convertToInt(const string& edge) {
+				uint64_t ret = 0;
+				for(int i = 0; i < edge.size(); i++) {
+					ret += ((DnaChar::MakeUpChar(edge[i]) & 0x03) << (2*i));
+				}
+				return ret;
+			}
 		};
 
 
@@ -664,17 +681,16 @@ namespace TwoPaCo
 				const std::string & tmpDirectory,
 				size_t round,
 				std::unique_ptr<std::runtime_error> & error,
-				tbb::mutex & errorMutex) : hashFunction(hashFunction), vertexLength(vertexLength), taskQueue(taskQueue),
-				 occurenceSet(occurenceSet), mutex(mutex), tmpDirectory(tmpDirectory), round(round), error(error), errorMutex(errorMutex)
+				tbb::mutex & errorMutex,
+				size_t & ioTime) : hashFunction(hashFunction), vertexLength(vertexLength), taskQueue(taskQueue),
+				 occurenceSet(occurenceSet), mutex(mutex), tmpDirectory(tmpDirectory), round(round), error(error),
+				 errorMutex(errorMutex), ioTime(ioTime)
 			{
 
 			}
 
 			void operator()()
 			{
-				//ConcurrentBitVector candidateMask(Task::TASK_SIZE);
-				CuckooFilter<size_t, 32> tempFilter(Task::TASK_SIZE);
-				CuckooFilter<size_t, 32> candidateFilter(Task::TASK_SIZE);
 				while (true)
 				{
 					Task task;
@@ -694,31 +710,27 @@ namespace TwoPaCo
 						if (task.str.size() >= vertexLength + 2)
 						{
 							VertexRollingHash hash(hashFunction, task.str.begin() + 1, 1);
+							CuckooFilter<uint64_t, 32> candidateFilter(Task::TASK_SIZE);
+							try
 							{
-								try
-								{
-									tempFilter.readFromFile(CandidateMaskFileName(tmpDirectory, task.seqId, task.start, round), false);
-									for(size_t pos = 0; pos < task.str.size() - vertexLength - 1; pos++) {
-										if(tempFilter.Contain(pos) == cuckoofilter::Ok) {
-											candidateFilter.Add(pos);
-										}
-									}
-									std::cout <<" filter size = " << candidateFilter.Size() << endl;
-								}
-								catch (std::runtime_error & err)
-								{
-									ReportError(errorMutex, error, err.what());
-								}
+								auto start = std::chrono::system_clock::now();
+								candidateFilter.readFromFile(CandidateMaskFileName(tmpDirectory, task.seqId, task.start, round), false);
+								auto end = std::chrono::system_clock::now();
+								std::chrono::duration<double, std::milli> elapsed_mseconds = end - start;
+								ioTime += elapsed_mseconds.count();
 							}
-
+							catch (std::runtime_error & err)
+							{
+								ReportError(errorMutex, error, err.what());
+							}
 							for (size_t pos = 1;; ++pos)
 							{
 								char posPrev = task.str[pos - 1];
 								char posExtend = task.str[pos + vertexLength];
-								if (candidateFilter.Contain(pos) == cuckoofilter::Ok)
+								if (candidateFilter.Contain(pos) == Status::Ok)
 								{
 									Occurence now;
-									bool isBifurcation = false;						
+									bool isBifurcation = false;
 									now.Set(hash.RawPositiveHash(0),
 										hash.RawNegativeHash(0),
 										task.str.begin() + pos,
@@ -767,6 +779,7 @@ namespace TwoPaCo
 			size_t round;
 			std::unique_ptr<std::runtime_error> & error;
 			tbb::mutex & errorMutex;
+			size_t & ioTime;
 		};
 
 		struct EdgeResult
@@ -813,7 +826,7 @@ namespace TwoPaCo
 				currentStubVertexId(currentStubVertexId), currentStubVertexMutex(currentStubVertexMutex), totalRounds(totalRounds)
 			{
 
-			}							
+			}
 
 			void operator()()
 			{
@@ -821,10 +834,6 @@ namespace TwoPaCo
 				{
 					DnaString bitBuf;
 					std::deque<EdgeResult> result;
-					//ConcurrentBitVector temporaryMask(Task::TASK_SIZE);
-					//ConcurrentBitVector candidateMask(Task::TASK_SIZE);
-					CuckooFilter<size_t, 32> candidateFilter(Task::TASK_SIZE);
-					CuckooFilter<size_t, 32> tempFilter(Task::TASK_SIZE);
 					while (true)
 					{
 						Task task;
@@ -842,15 +851,18 @@ namespace TwoPaCo
 
 							size_t edgeLength = vertexLength + 1;
 							if (task.str.size() >= vertexLength + 2)
-							{																
+							{
+								CuckooFilter<uint64_t, 32> candidateFilter(Task::TASK_SIZE);
 								try
-								{	
-									//candidateMask.Reset();
+								{
 									for (size_t i = 0; i < totalRounds; i++)
 									{
+										CuckooFilter<uint64_t, 32> tempFilter(Task::TASK_SIZE);
 										tempFilter.readFromFile(CandidateMaskFileName(tmpDirectory, task.seqId, task.start, i), true);
-										for(size_t pos = 0; pos < task.str.size() - vertexLength - 1; pos++) {
-											if(tempFilter.Contain(pos) == cuckoofilter::Ok) {
+										for(size_t pos = 0; pos < task.str.size(); pos++)
+										{
+											if(tempFilter.Contain(pos) == Status::Ok)
+											{
 												candidateFilter.Add(pos);
 											}
 										}
@@ -861,8 +873,6 @@ namespace TwoPaCo
 									ReportError(errorMutex, error, err.what());
 								}
 
-								size_t taskstart = task.start;
-
 								EdgeResult currentResult;
 								currentResult.pieceId = task.piece;
 								size_t definiteCount = std::count_if(task.str.begin() + 1, task.str.begin() + vertexLength + 1, DnaChar::IsDefinite);
@@ -871,7 +881,7 @@ namespace TwoPaCo
 									while (result.size() > 0 && FlushEdgeResults(result, writer, currentPiece));
 									int64_t bifId(INVALID_VERTEX);
 									assert(definiteCount == std::count_if(task.str.begin() + pos, task.str.begin() + pos + vertexLength, DnaChar::IsDefinite));
-									if (definiteCount == vertexLength && (candidateFilter.Contain(pos) == cuckoofilter::Ok))
+									if (definiteCount == vertexLength && (candidateFilter.Contain(pos) == Status::Ok))
 									{
 										bifId = bifStorage.GetId(task.str.begin() + pos);
 										if (bifId != INVALID_VERTEX)
@@ -884,7 +894,7 @@ namespace TwoPaCo
 									if (((task.start == 0 && pos == 1) || (task.isFinal && pos == task.str.size() - vertexLength - 1)) && bifId == INVALID_VERTEX)
 									{
 										occurences++;
-										currentStubVertexMutex.lock();								
+										currentStubVertexMutex.lock();
 										currentResult.junction.push_back(JunctionPosition(task.seqId, task.start + pos - 1, currentStubVertexId++));
 										currentStubVertexMutex.unlock();
 									}
@@ -930,26 +940,21 @@ namespace TwoPaCo
 			size_t totalRounds;
 			tbb::mutex & errorMutex;
 			tbb::mutex & currentStubVertexMutex;
-		};		
-		
+		};
+
 		class FilterFillerWorker
 		{
 		public:
-			FilterFillerWorker(uint64_t low,
-				uint64_t high,
-				const VertexRollingHashSeed & hashFunction,
+			FilterFillerWorker(
 				size_t edgeLength,
-				CuckooFilter<size_t, 32> & cFilter,
-				TaskQueue & taskQueue) : low(low), high(high),
-				hashFunction(hashFunction), cFilter(cFilter), taskQueue(taskQueue), edgeLength(edgeLength)
+				CuckooFilter<uint64_t, 32> & cFilter,
+				TaskQueue & taskQueue) : cFilter(cFilter), taskQueue(taskQueue), edgeLength(edgeLength)
 			{
 
 			}
 
 			void operator()()
 			{
-				std::vector<size_t> setup;
-				std::vector<uint64_t> hashValue;
 				const char DUMMY_CHAR = DnaChar::LITERAL[0];
 				const char REV_DUMMY_CHAR = DnaChar::ReverseChar(DUMMY_CHAR);
 				while (true)
@@ -967,50 +972,56 @@ namespace TwoPaCo
 							continue;
 						}
 
-						uint64_t fistMinHash0;
-						uint64_t secondMinHash0;
 						size_t vertexLength = edgeLength - 1;
 						size_t definiteCount = std::count_if(task.str.begin(), task.str.begin() + vertexLength, DnaChar::IsDefinite);
-						VertexRollingHash hash(hashFunction, task.str.begin(), hashFunction.HashFunctionsNumber());
 
 						for (size_t pos = 0;; ++pos)
 						{
-							hashValue.clear();
 							char prevCh = task.str[pos];
 							char nextCh = task.str[pos + edgeLength - 1];
 							assert(definiteCount == std::count_if(task.str.begin() + pos, task.str.begin() + pos + vertexLength, DnaChar::IsDefinite));
 							if (definiteCount == vertexLength)
 							{
-								fistMinHash0 = hash.GetVertexHash();
+								string vertex = task.str.substr(pos, vertexLength);
 								if (DnaChar::IsDefinite(nextCh))
 								{
-									GetOutgoingEdgeHash(hash, nextCh, hashValue);
+									string edge = vertex + nextCh;
+									uint64_t edgeVal = getCanonicalVal(edge);
+									if(cFilter.Contain(edgeVal) != Status::Ok)
+									{
+										cFilter.Add(edgeVal);
+									}
 								}
 								else
 								{
-									GetOutgoingEdgeHash(hash, DUMMY_CHAR, hashValue);
-									GetOutgoingEdgeHash(hash, REV_DUMMY_CHAR, hashValue);
-								}
+									string edge = vertex + DUMMY_CHAR;
+									uint64_t edgeVal = getCanonicalVal(edge);
+									if(cFilter.Contain(edgeVal) != Status::Ok)
+									{
+										cFilter.Add(edgeVal);
+									}
+									edge = vertex + REV_DUMMY_CHAR;
+									edgeVal = getCanonicalVal(edge);
+									if(cFilter.Contain(edgeVal) != Status::Ok)
+									{
+										cFilter.Add(edgeVal);
+									}
 
+								}
 								if (pos > 0 && !DnaChar::IsDefinite(task.str[pos - 1]))
 								{
-									GetIngoingEdgeHash(hash, DUMMY_CHAR, hashValue);
-									GetIngoingEdgeHash(hash, REV_DUMMY_CHAR, hashValue);
-								}
-							}
-
-							hash.Update(prevCh, nextCh);
-							assert(hash.Assert(task.str.begin() + pos + 1));
-							if (definiteCount == vertexLength)
-							{
-								secondMinHash0 = hash.GetVertexHash();
-								if (Within(fistMinHash0, low, high) || Within(secondMinHash0, low, high))
-								{
-									cFilter.Add(pos);
-									/*for (uint64_t value : hashValue)
+									string edge = DUMMY_CHAR + vertex;
+									uint64_t edgeVal = getCanonicalVal(edge);
+									if(cFilter.Contain(edgeVal) != Status::Ok)
 									{
-										setup.push_back(value);
-									}*/
+										cFilter.Add(edgeVal);
+									}
+									edge = REV_DUMMY_CHAR + vertex;
+									edgeVal = getCanonicalVal(edge);
+									if(cFilter.Contain(edgeVal) != Status::Ok)
+									{
+										cFilter.Add(edgeVal);
+									}
 								}
 							}
 
@@ -1024,26 +1035,30 @@ namespace TwoPaCo
 							}
 						}
 					}
-
-					/*for (uint64_t hashValue : setup)
-					{
-						if (cFilter.Contain((size_t)hashValue) != cuckoofilter::Ok)
-						{
-							cFilter.Add((size_t)hashValue);
-						}
-					}*/
-
-					setup.clear();
 				}
 			}
 
 		private:
-			uint64_t low;
-			uint64_t high;
-			const VertexRollingHashSeed & hashFunction;
 			size_t edgeLength;
-			CuckooFilter<size_t, 32> & cFilter;
+			CuckooFilter<uint64_t, 32> & cFilter;
 			TaskQueue & taskQueue;
+
+			uint64_t getCanonicalVal(const string& edge) {
+				string revEdge = DnaChar::ReverseCompliment(edge);
+				int comRet = edge.compare(revEdge);
+				if(comRet > 0) {
+					return convertToInt(revEdge);
+				} else {
+					return convertToInt(edge);
+				}
+			}
+			uint64_t convertToInt(const string& edge) {
+				uint64_t ret = 0;
+				for(int i = 0; i < edge.size(); i++) {
+					ret += ((DnaChar::MakeUpChar(edge[i]) & 0x03) << (2*i));
+				}
+				return ret;
+			}
 		};
 
 
@@ -1134,7 +1149,7 @@ namespace TwoPaCo
 				TaskQueuePtr & q = taskQueue[nowQueue];
 				while (!taskQueue[i]->try_push(Task(0, Task::GAME_OVER, 0, true, std::string())))
 				{
-					
+
 				}
 			}
 		}
@@ -1165,7 +1180,7 @@ namespace TwoPaCo
 
 		size_t vertexSize_;
 		DISALLOW_COPY_AND_ASSIGN(VertexEnumeratorImpl<CAPACITY>);
-	};	
+	};
 }
 
-#endif	
+#endif
